@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+data/db/
+data/attendance_exports/
+outputs/
+
+data/test_photos/

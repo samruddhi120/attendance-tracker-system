@@ -12,7 +12,7 @@ import os
 import face_recognition
 
 from config import ENROLLMENT_DIR
-from db import init_db, add_student, add_embedding
+from db import init_db, add_student, add_embedding, get_enrolled_photo_names
 
 
 def parse_folder_name(folder_name):
@@ -29,15 +29,21 @@ def enroll_student(roll_no, name, folder_path):
     """
     Processes every photo in folder_path for one student and saves their
     embeddings to SQLite. Returns the number of photos successfully enrolled.
+    Photos already embedded for this roll_no (by filename) are skipped, so
+    re-running enrollment on the same folder doesn't duplicate embeddings.
 
     Pulled out as its own function so both the CLI batch run below and the
     Streamlit "Enroll Student" tab can call the same logic on one student
     at a time, instead of duplicating it.
     """
     add_student(roll_no, name)
+    already_enrolled = get_enrolled_photo_names(roll_no)
 
     photos_enrolled = 0
     for photo_name in os.listdir(folder_path):
+        if photo_name in already_enrolled:
+            continue
+
         photo_path = os.path.join(folder_path, photo_name)
         image = face_recognition.load_image_file(photo_path)
         face_encodings = face_recognition.face_encodings(image)

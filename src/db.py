@@ -92,6 +92,18 @@ def add_embedding(roll_no, embedding, source_photo=None):
     conn.close()
 
 
+def get_enrolled_photo_names(roll_no):
+    """Photo filenames already embedded for this student, so enroll_student()
+    can skip re-processing photos it has already saved."""
+    conn = get_connection()
+    rows = conn.execute(
+        "SELECT DISTINCT source_photo FROM embeddings WHERE roll_no = ?",
+        (roll_no,),
+    ).fetchall()
+    conn.close()
+    return {row[0] for row in rows}
+
+
 def get_all_embeddings():
     """
     Returns: { roll_no: {"name": str, "embeddings": [np.ndarray, ...]} }
@@ -152,3 +164,16 @@ def get_all_students():
     ).fetchall()
     conn.close()
     return rows
+
+
+def delete_attendance(roll_no, date):
+    """Removes one student's attendance row for a date. Returns True if a row was deleted."""
+    conn = get_connection()
+    cursor = conn.execute(
+        "DELETE FROM attendance WHERE roll_no = ? AND date = ?",
+        (roll_no, date),
+    )
+    conn.commit()
+    deleted = cursor.rowcount > 0
+    conn.close()
+    return deleted

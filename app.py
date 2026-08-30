@@ -23,7 +23,7 @@ import cv2
 from PIL import Image
 
 from config import ENROLLMENT_DIR, MASTER_WORKBOOK, MATCH_THRESHOLD
-from db import init_db, get_all_embeddings, get_attendance_for_date, get_all_students
+from db import init_db, get_all_embeddings, get_attendance_for_date, get_all_students, delete_attendance
 from recognize import recognize_faces
 from attendance_logger import mark_present
 from excel_writer import export_day
@@ -240,6 +240,24 @@ with tab_report:
         col2.metric("Absent", len(df) - int(present_count))
 
         st.dataframe(df, use_container_width=True)
+
+        present_students = [(roll_no, name) for roll_no, name in all_students if roll_no in present_rows]
+        if present_students:
+            st.markdown("#### Undo a wrong mark")
+            st.caption("Wrongly confirmed someone as present? Remove them from this date below.")
+            undo_options = [f"{name} ({r})" for r, name in sorted(present_students, key=lambda x: x[1])]
+            undo_label = st.selectbox(
+                "Student to remove from today's Present list",
+                options=undo_options,
+                key=f"undo_select_{date_str}",
+            )
+            if st.button("Undo attendance for this student"):
+                name_part, roll_part = undo_label.rsplit(" (", 1)
+                undo_roll_no = roll_part.rstrip(")")
+                if delete_attendance(undo_roll_no, date_str):
+                    export_day(date_str)
+                    st.success(f"Removed {name_part} from {date_str}. Excel report updated.")
+                    st.rerun()
     else:
         st.info("No students enrolled yet - use the Enroll Student tab first.")
 

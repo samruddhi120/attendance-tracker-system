@@ -12,6 +12,11 @@ from recognize import recognize_faces
 
 def process_photo(image_path, source, enrolled_data, session_date=None, upsample=1):
     """
+    Used by the CLI script (scripts/mark_attendance_from_photo.py) for a quick
+    unreviewed test run - auto-commits every match straight to the DB.
+    The Streamlit app's Take Attendance tab uses mark_present() below instead,
+    after the professor reviews/corrects each face.
+
     source: a label like "phone" or "smartboard", stored per attendance row
     so you can compute accuracy separately for each, as your eval plan needs.
 
@@ -37,3 +42,15 @@ def process_photo(image_path, source, enrolled_data, session_date=None, upsample
         (marked if was_new else already_marked).append((roll_no, name))
 
     return marked, already_marked, unknown_count
+
+
+def mark_present(roll_no, name, source, session_date=None):
+    """
+    Marks one student present. Used by the review workflow for both
+    confirmed face matches and manually-added students (source="manual").
+    Returns True if newly marked, False if already marked for that date.
+    """
+    init_db()
+    session_date = session_date or datetime.now().strftime("%Y-%m-%d")
+    time_now = datetime.now().strftime("%H:%M:%S")
+    return mark_attendance(roll_no, name, session_date, time_now, source)

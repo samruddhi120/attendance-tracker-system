@@ -142,3 +142,13 @@ def get_attendance_for_date(date):
     ).fetchall()
     conn.close()
     return rows
+
+
+def get_all_students():
+    """Full roster, regardless of whether they've ever been marked present."""
+    conn = get_connection()
+    rows = conn.execute(
+        "SELECT roll_no, name FROM students ORDER BY name"
+    ).fetchall()
+    conn.close()
+    return rows

@@ -1,7 +1,9 @@
 """
 Streamlit UI for the attendance system - three tabs:
-  - Take Attendance: upload a group photo, review/correct each detected
-    face (and manually add anyone missed) before saving, then export
+  - Take Attendance: upload or camera-capture a group photo, review/correct
+    each detected face (and manually add anyone missed) before saving, then
+    export. Also lets you save a fresh close-up photo straight to a
+    student's profile when their face wasn't recognized.
   - Enroll Student: upload photos for a new student, straight into SQLite
   - View Report: browse a day's full roster (Present + Absent) and
     download the Excel workbook
@@ -51,13 +53,27 @@ with tab_attendance:
     session_date_str = session_date.strftime("%Y-%m-%d")
 
     source = st.radio("Photo source", ["phone", "smartboard"], horizontal=True)
-    uploaded_photo = st.file_uploader(
-        "Upload a group photo", type=["jpg", "jpeg", "png"], key="attendance_photo"
+
+    capture_method = st.radio(
+        "How do you want to provide the photo?",
+        ["Upload a photo", "Use camera"],
+        horizontal=True,
+        key="capture_method",
     )
+    if capture_method == "Upload a photo":
+        uploaded_photo = st.file_uploader(
+            "Upload a group photo", type=["jpg", "jpeg", "png"], key="attendance_photo"
+        )
+    else:
+        uploaded_photo = st.camera_input("Take a class photo", key="attendance_camera")
 
     # ---- Step 1: detect ----
     if uploaded_photo is not None and st.session_state.review is None:
-        temp_path = os.path.join("data", "raw_uploads", uploaded_photo.name)
+        # Timestamp-prefixed so repeated camera captures (which all share the
+        # same filename) don't overwrite each other in raw_uploads.
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        photo_name = getattr(uploaded_photo, "name", "camera_capture.jpg")
+        temp_path = os.path.join("data", "raw_uploads", f"{timestamp}_{photo_name}")
         os.makedirs(os.path.dirname(temp_path), exist_ok=True)
         with open(temp_path, "wb") as f:
             f.write(uploaded_photo.getbuffer())
@@ -137,6 +153,34 @@ with tab_attendance:
                     key=f"face_select_{rid}_{i}",
                 )
             selections.append(chosen)
+
+        if enrolled_data:
+            st.markdown("#### Student not recognized? Add a quick photo")
+            st.caption(
+                "Take a clear, close-up photo of the student and save it straight to their "
+                "profile - this improves recognition next time without needing the full Enroll tab."
+            )
+            fix_options = [f"{d['name']} ({r})" for r, d in sorted(enrolled_data.items(), key=lambda kv: kv[1]["name"])]
+            fix_label = st.selectbox("Student", options=fix_options, key=f"fix_student_select_{rid}")
+            fix_photo = st.camera_input("Take a photo", key=f"fix_student_camera_{rid}")
+
+            if fix_photo is not None and st.button("Add this photo to their profile"):
+                fix_name, fix_roll_part = fix_label.rsplit(" (", 1)
+                fix_roll_no = fix_roll_part.rstrip(")")
+
+                folder_path = os.path.join(ENROLLMENT_DIR, f"{fix_roll_no}_{fix_name.replace(' ', '_')}")
+                os.makedirs(folder_path, exist_ok=True)
+                photo_filename = f"quick_{datetime.now().strftime('%Y%m%d_%H%M%S')}.jpg"
+                with open(os.path.join(folder_path, photo_filename), "wb") as f:
+                    f.write(fix_photo.getbuffer())
+
+                with st.spinner("Saving..."):
+                    count = enroll_student(fix_roll_no, fix_name, folder_path)
+
+                if count:
+                    st.success(f"Added a new photo to {fix_name}'s profile.")
+                else:
+                    st.error("No face detected in that photo - try again with better lighting/framing.")
 
         selected_roll_nos = {label_to_id[s][0] for s in selections if label_to_id[s][0]}
         missing_students = [(r, d["name"]) for r, d in enrolled_data.items() if r not in selected_roll_nos]

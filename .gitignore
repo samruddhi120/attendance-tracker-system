@@ -5,6 +5,7 @@ venv/
 
 data/db/
 data/attendance_exports/
+data/raw_uploads/
 outputs/
 
 data/test_photos/

@@ -24,6 +24,23 @@ conda install -c conda-forge dlib
 pip install face_recognition
 ```
 
+**Windows without conda/Visual Studio:** if you have no CMake or C++ build tools
+installed, dlib can't compile from source. Use the prebuilt `dlib-bin` wheel
+instead:
+```
+pip install dlib-bin
+pip install --no-deps face_recognition face_recognition_models
+pip install opencv-python openpyxl numpy pandas streamlit "setuptools<81"
+```
+(`--no-deps` is needed because pip's dependency resolver looks for a package
+literally named `dlib`, not `dlib-bin`, and would otherwise try to build it
+from source anyway.)
+
+**Note:** don't create `venv/` inside a OneDrive-synced folder if you'll ever
+open the project on another machine - a venv hardcodes absolute paths to the
+Python interpreter it was created with, so a synced copy breaks on any other
+machine. Recreate the venv locally instead (`python -m venv venv`) if that happens.
+
 ## Enrollment
 
 Put student photos in `data/enrollment/<roll_no>_<name>/`, e.g.:

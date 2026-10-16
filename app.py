@@ -1,12 +1,14 @@
 """
-Streamlit UI for the attendance system - three tabs:
-  - Take Attendance: upload or camera-capture a group photo, review/correct
-    each detected face (and manually add anyone missed) before saving, then
+Streamlit UI for the attendance system - a teacher logs in, then works in
+three tabs:
+  - Take Attendance: pick the Class and Subject you're assigned to teach,
+    then upload or camera-capture a group photo, review/correct each
+    detected face (and manually add anyone missed) before saving, then
     export. Also lets you save a fresh close-up photo straight to a
     student's profile when their face wasn't recognized.
-  - Enroll Student: upload photos for a new student, straight into SQLite
-  - View Report: browse a day's full roster (Present + Absent) and
-    download the Excel workbook
+  - Enroll Student: upload photos for a new student into a chosen class
+  - View Report: pick Class + Subject + Date to browse that session's full
+    roster (Present + Absent) and download that class+subject's workbook
 
 Run with:
     streamlit run app.py
@@ -24,22 +26,57 @@ import numpy as np
 import cv2
 from PIL import Image
 
-from config import ENROLLMENT_DIR, MASTER_WORKBOOK, MATCH_THRESHOLD
-from db import init_db, get_all_embeddings, get_attendance_for_date, get_all_students, delete_attendance
+from config import ENROLLMENT_DIR, MATCH_THRESHOLD
+from db import (
+    init_db,
+    verify_teacher_login,
+    get_all_classes,
+    get_classes_for_teacher,
+    get_subjects_for_teacher_and_class,
+    get_all_embeddings,
+    get_students_by_class,
+    get_attendance_for_session,
+    delete_attendance,
+)
 from recognize import recognize_faces
 from attendance_logger import mark_present
-from excel_writer import export_day
+from excel_writer import export_class_subject, get_workbook_path
 from enroll import enroll_student
 
 st.set_page_config(page_title="Attendance System", layout="wide")
 init_db()
 
+if "teacher" not in st.session_state:
+    st.session_state.teacher = None
 if "review" not in st.session_state:
     st.session_state.review = None
 if "review_id" not in st.session_state:
     st.session_state.review_id = 0
 
 st.title("Face Recognition Attendance System")
+
+# --------------------------------------------------------------------- Login
+if st.session_state.teacher is None:
+    st.subheader("Teacher Login")
+    login_username = st.text_input("Username", key="login_username")
+    login_password = st.text_input("Password", type="password", key="login_password")
+    if st.button("Log in"):
+        teacher = verify_teacher_login(login_username, login_password)
+        if teacher:
+            st.session_state.teacher = teacher
+            st.rerun()
+        else:
+            st.error("Incorrect username or password.")
+    st.stop()
+
+teacher = st.session_state.teacher
+
+with st.sidebar:
+    st.markdown(f"**Logged in as:** {teacher['name']}")
+    if st.button("Log out"):
+        st.session_state.teacher = None
+        st.session_state.review = None
+        st.rerun()
 
 tab_attendance, tab_enroll, tab_report = st.tabs(
     ["Take Attendance", "Enroll Student", "View Report"]
@@ -49,267 +86,334 @@ tab_attendance, tab_enroll, tab_report = st.tabs(
 with tab_attendance:
     st.subheader("Mark attendance from a group photo")
 
-    session_date = st.date_input("Session date", value=datetime.now(), key="session_date")
-    session_date_str = session_date.strftime("%Y-%m-%d")
-
-    source = st.radio("Photo source", ["phone", "smartboard"], horizontal=True)
-
-    capture_method = st.radio(
-        "How do you want to provide the photo?",
-        ["Upload a photo", "Use camera"],
-        horizontal=True,
-        key="capture_method",
-    )
-    if capture_method == "Upload a photo":
-        uploaded_photo = st.file_uploader(
-            "Upload a group photo", type=["jpg", "jpeg", "png"], key="attendance_photo"
-        )
+    class_options = get_classes_for_teacher(teacher["id"])
+    if not class_options:
+        st.warning("You have no classes assigned. Ask the admin to assign you a class and subject.")
     else:
-        uploaded_photo = st.camera_input("Take a class photo", key="attendance_camera")
+        class_id_by_name = {name: cid for cid, name in class_options}
+        selected_class_name = st.selectbox("Class", options=list(class_id_by_name.keys()), key="ta_class")
+        selected_class_id = class_id_by_name[selected_class_name]
 
-    # ---- Step 1: detect ----
-    if uploaded_photo is not None and st.session_state.review is None:
-        # Timestamp-prefixed so repeated camera captures (which all share the
-        # same filename) don't overwrite each other in raw_uploads.
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        photo_name = getattr(uploaded_photo, "name", "camera_capture.jpg")
-        temp_path = os.path.join("data", "raw_uploads", f"{timestamp}_{photo_name}")
-        os.makedirs(os.path.dirname(temp_path), exist_ok=True)
-        with open(temp_path, "wb") as f:
-            f.write(uploaded_photo.getbuffer())
+        subject_options = get_subjects_for_teacher_and_class(teacher["id"], selected_class_id)
+        if not subject_options:
+            st.warning(f"You have no subjects assigned for {selected_class_name}.")
+        else:
+            subject_id_by_name = {name: sid for sid, name in subject_options}
+            selected_subject_name = st.selectbox("Subject", options=list(subject_id_by_name.keys()), key="ta_subject")
+            selected_subject_id = subject_id_by_name[selected_subject_name]
 
-        if st.button("Detect Faces"):
-            enrolled_data = get_all_embeddings()
-            if not enrolled_data:
-                st.error("No students enrolled yet - use the Enroll Student tab first.")
+            session_date = st.date_input("Session date", value=datetime.now(), key="session_date")
+            session_date_str = session_date.strftime("%Y-%m-%d")
+
+            source = st.radio("Photo source", ["phone", "smartboard"], horizontal=True)
+
+            capture_method = st.radio(
+                "How do you want to provide the photo?",
+                ["Upload a photo", "Use camera"],
+                horizontal=True,
+                key="capture_method",
+            )
+            if capture_method == "Upload a photo":
+                uploaded_photo = st.file_uploader(
+                    "Upload a group photo", type=["jpg", "jpeg", "png"], key="attendance_photo"
+                )
             else:
-                upsample = 2 if source == "smartboard" else 1
-                with st.spinner("Detecting and recognizing faces..."):
-                    results, locations = recognize_faces(temp_path, enrolled_data, upsample=upsample)
+                uploaded_photo = st.camera_input("Take a class photo", key="attendance_camera")
 
-                st.session_state.review_id += 1
-                st.session_state.review = {
-                    "id": st.session_state.review_id,
-                    "image_path": temp_path,
-                    "source": source,
-                    "session_date": session_date_str,
-                    "faces": [
-                        {"location": loc, "matched_roll_no": r, "matched_name": n, "distance": d}
-                        for loc, (r, n, d) in zip(locations, results)
-                    ],
-                }
-                st.rerun()
+            # ---- Step 1: detect ----
+            if uploaded_photo is not None and st.session_state.review is None:
+                # Timestamp-prefixed so repeated camera captures (which all share the
+                # same filename) don't overwrite each other in raw_uploads.
+                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                photo_name = getattr(uploaded_photo, "name", "camera_capture.jpg")
+                temp_path = os.path.join("data", "raw_uploads", f"{timestamp}_{photo_name}")
+                os.makedirs(os.path.dirname(temp_path), exist_ok=True)
+                with open(temp_path, "wb") as f:
+                    f.write(uploaded_photo.getbuffer())
 
-    # ---- Step 2: review, correct, and confirm ----
-    review = st.session_state.review
-    if review is not None:
-        enrolled_data = get_all_embeddings()
-        rid = review["id"]
+                if st.button("Detect Faces"):
+                    enrolled_data = get_all_embeddings(class_id=selected_class_id)
+                    if not enrolled_data:
+                        st.error(f"No students enrolled in {selected_class_name} yet - use the Enroll Student tab first.")
+                    else:
+                        upsample = 2 if source == "smartboard" else 1
+                        with st.spinner("Detecting and recognizing faces..."):
+                            results, locations = recognize_faces(temp_path, enrolled_data, upsample=upsample)
 
-        img_array = np.array(Image.open(review["image_path"]).convert("RGB"))
+                        st.session_state.review_id += 1
+                        st.session_state.review = {
+                            "id": st.session_state.review_id,
+                            "image_path": temp_path,
+                            "source": source,
+                            "session_date": session_date_str,
+                            "class_id": selected_class_id,
+                            "class_name": selected_class_name,
+                            "subject_id": selected_subject_id,
+                            "subject_name": selected_subject_name,
+                            "teacher_id": teacher["id"],
+                            "faces": [
+                                {"location": loc, "matched_roll_no": r, "matched_name": n, "distance": d}
+                                for loc, (r, n, d) in zip(locations, results)
+                            ],
+                        }
+                        st.rerun()
 
-        # Full annotated overview - green if a face currently has a confident
-        # match, red if it's Unknown / below threshold.
-        annotated = img_array.copy()
-        for face in review["faces"]:
-            top, right, bottom, left = face["location"]
-            confident = face["matched_roll_no"] and face["distance"] is not None and face["distance"] <= MATCH_THRESHOLD
-            color = (0, 200, 0) if confident else (200, 0, 0)
-            label = f"{face['matched_name']} ({face['matched_roll_no']})" if confident else "Unknown"
-            cv2.rectangle(annotated, (left, top), (right, bottom), color, 2)
-            cv2.putText(annotated, label, (left, max(top - 10, 10)), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
-        st.image(annotated, caption=f"{len(review['faces'])} face(s) detected", use_container_width=True)
+            # ---- Step 2: review, correct, and confirm ----
+            review = st.session_state.review
+            if review is not None:
+                enrolled_data = get_all_embeddings(class_id=review["class_id"])
+                rid = review["id"]
 
-        if not review["faces"]:
-            st.warning("No faces detected in this photo at all - use manual marking below, or rescan with a clearer photo.")
+                img_array = np.array(Image.open(review["image_path"]).convert("RGB"))
 
-        option_labels = ["Unknown / Not a student"] + [f"{d['name']} ({r})" for r, d in enrolled_data.items()]
-        label_to_id = {"Unknown / Not a student": (None, None)}
-        for r, d in enrolled_data.items():
-            label_to_id[f"{d['name']} ({r})"] = (r, d["name"])
+                # Full annotated overview - green if a face currently has a confident
+                # match, red if it's Unknown / below threshold.
+                annotated = img_array.copy()
+                for face in review["faces"]:
+                    top, right, bottom, left = face["location"]
+                    confident = face["matched_roll_no"] and face["distance"] is not None and face["distance"] <= MATCH_THRESHOLD
+                    color = (0, 200, 0) if confident else (200, 0, 0)
+                    label = f"{face['matched_name']} ({face['matched_roll_no']})" if confident else "Unknown"
+                    cv2.rectangle(annotated, (left, top), (right, bottom), color, 2)
+                    cv2.putText(annotated, label, (left, max(top - 10, 10)), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+                st.image(annotated, caption=f"{len(review['faces'])} face(s) detected", use_container_width=True)
 
-        st.markdown("#### Review each detected face")
-        st.caption("Correct any wrong or missing matches before saving - nothing is written to the database yet.")
+                st.caption(f"Class: {review['class_name']}  |  Subject: {review['subject_name']}  |  Date: {review['session_date']}")
 
-        selections = []
-        for i, face in enumerate(review["faces"]):
-            top, right, bottom, left = face["location"]
-            crop = img_array[max(top, 0):bottom, max(left, 0):right]
+                if not review["faces"]:
+                    st.warning("No faces detected in this photo at all - use manual marking below, or rescan with a clearer photo.")
 
-            confident = face["matched_roll_no"] and face["distance"] is not None and face["distance"] <= MATCH_THRESHOLD
-            default_label = f"{face['matched_name']} ({face['matched_roll_no']})" if confident else "Unknown / Not a student"
-            default_index = option_labels.index(default_label) if default_label in option_labels else 0
+                option_labels = ["Unknown / Not a student"] + [f"{d['name']} ({r})" for r, d in enrolled_data.items()]
+                label_to_id = {"Unknown / Not a student": (None, None)}
+                for r, d in enrolled_data.items():
+                    label_to_id[f"{d['name']} ({r})"] = (r, d["name"])
 
-            col1, col2 = st.columns([1, 3])
-            with col1:
-                if crop.size > 0:
-                    st.image(crop, width=100)
-            with col2:
-                chosen = st.selectbox(
-                    f"Face {i + 1}"
-                    + (f" (distance {face['distance']:.2f})" if face["distance"] is not None else ""),
-                    options=option_labels,
-                    index=default_index,
-                    key=f"face_select_{rid}_{i}",
-                )
-            selections.append(chosen)
+                st.markdown("#### Review each detected face")
+                st.caption("Correct any wrong or missing matches before saving - nothing is written to the database yet.")
 
-        if enrolled_data:
-            st.markdown("#### Student not recognized? Add a quick photo")
-            st.caption(
-                "Take a clear, close-up photo of the student and save it straight to their "
-                "profile - this improves recognition next time without needing the full Enroll tab."
-            )
-            fix_options = [f"{d['name']} ({r})" for r, d in sorted(enrolled_data.items(), key=lambda kv: kv[1]["name"])]
-            fix_label = st.selectbox("Student", options=fix_options, key=f"fix_student_select_{rid}")
-            fix_photo = st.camera_input("Take a photo", key=f"fix_student_camera_{rid}")
+                selections = []
+                for i, face in enumerate(review["faces"]):
+                    top, right, bottom, left = face["location"]
+                    crop = img_array[max(top, 0):bottom, max(left, 0):right]
 
-            if fix_photo is not None and st.button("Add this photo to their profile"):
-                fix_name, fix_roll_part = fix_label.rsplit(" (", 1)
-                fix_roll_no = fix_roll_part.rstrip(")")
+                    confident = face["matched_roll_no"] and face["distance"] is not None and face["distance"] <= MATCH_THRESHOLD
+                    default_label = f"{face['matched_name']} ({face['matched_roll_no']})" if confident else "Unknown / Not a student"
+                    default_index = option_labels.index(default_label) if default_label in option_labels else 0
 
-                folder_path = os.path.join(ENROLLMENT_DIR, f"{fix_roll_no}_{fix_name.replace(' ', '_')}")
-                os.makedirs(folder_path, exist_ok=True)
-                photo_filename = f"quick_{datetime.now().strftime('%Y%m%d_%H%M%S')}.jpg"
-                with open(os.path.join(folder_path, photo_filename), "wb") as f:
-                    f.write(fix_photo.getbuffer())
+                    col1, col2 = st.columns([1, 3])
+                    with col1:
+                        if crop.size > 0:
+                            st.image(crop, width=100)
+                    with col2:
+                        chosen = st.selectbox(
+                            f"Face {i + 1}"
+                            + (f" (distance {face['distance']:.2f})" if face["distance"] is not None else ""),
+                            options=option_labels,
+                            index=default_index,
+                            key=f"face_select_{rid}_{i}",
+                        )
+                    selections.append(chosen)
 
-                with st.spinner("Saving..."):
-                    count = enroll_student(fix_roll_no, fix_name, folder_path)
+                if enrolled_data:
+                    st.markdown("#### Student not recognized? Add a quick photo")
+                    st.caption(
+                        "Take a clear, close-up photo of the student and save it straight to their "
+                        "profile - this improves recognition next time without needing the full Enroll tab."
+                    )
+                    fix_options = [f"{d['name']} ({r})" for r, d in sorted(enrolled_data.items(), key=lambda kv: kv[1]["name"])]
+                    fix_label = st.selectbox("Student", options=fix_options, key=f"fix_student_select_{rid}")
+                    fix_photo = st.camera_input("Take a photo", key=f"fix_student_camera_{rid}")
 
-                if count:
-                    st.success(f"Added a new photo to {fix_name}'s profile.")
-                else:
-                    st.error("No face detected in that photo - try again with better lighting/framing.")
+                    if fix_photo is not None and st.button("Add this photo to their profile"):
+                        fix_name, fix_roll_part = fix_label.rsplit(" (", 1)
+                        fix_roll_no = fix_roll_part.rstrip(")")
 
-        selected_roll_nos = {label_to_id[s][0] for s in selections if label_to_id[s][0]}
-        missing_students = [(r, d["name"]) for r, d in enrolled_data.items() if r not in selected_roll_nos]
+                        folder_path = os.path.join(ENROLLMENT_DIR, f"{fix_roll_no}_{fix_name.replace(' ', '_')}")
+                        os.makedirs(folder_path, exist_ok=True)
+                        photo_filename = f"quick_{datetime.now().strftime('%Y%m%d_%H%M%S')}.jpg"
+                        with open(os.path.join(folder_path, photo_filename), "wb") as f:
+                            f.write(fix_photo.getbuffer())
 
-        manual_selected_labels = []
-        if missing_students:
-            st.markdown("#### Not detected - add manually if they were actually present")
-            missing_options = [f"{name} ({r})" for r, name in sorted(missing_students, key=lambda x: x[1])]
-            manual_selected_labels = st.multiselect(
-                "Select students to mark present",
-                options=missing_options,
-                key=f"manual_add_{rid}",
-            )
+                        with st.spinner("Saving..."):
+                            count = enroll_student(fix_roll_no, fix_name, folder_path)
 
-        col_save, col_rescan = st.columns(2)
-        with col_rescan:
-            if st.button("Rescan / Upload Different Photo"):
-                st.session_state.review = None
-                st.rerun()
+                        if count:
+                            st.success(f"Added a new photo to {fix_name}'s profile.")
+                        else:
+                            st.error("No face detected in that photo - try again with better lighting/framing.")
 
-        with col_save:
-            if st.button("Confirm & Save Attendance", type="primary"):
-                newly_marked = []
+                selected_roll_nos = {label_to_id[s][0] for s in selections if label_to_id[s][0]}
+                missing_students = [(r, d["name"]) for r, d in enrolled_data.items() if r not in selected_roll_nos]
 
-                for label in selections:
-                    roll_no, name = label_to_id[label]
-                    if roll_no:
-                        if mark_present(roll_no, name, review["source"], review["session_date"]):
-                            newly_marked.append((roll_no, name))
+                manual_selected_labels = []
+                if missing_students:
+                    st.markdown("#### Not detected - add manually if they were actually present")
+                    missing_options = [f"{name} ({r})" for r, name in sorted(missing_students, key=lambda x: x[1])]
+                    manual_selected_labels = st.multiselect(
+                        "Select students to mark present",
+                        options=missing_options,
+                        key=f"manual_add_{rid}",
+                    )
 
-                for label in manual_selected_labels:
-                    name_part, roll_part = label.rsplit(" (", 1)
-                    roll_no = roll_part.rstrip(")")
-                    if mark_present(roll_no, name_part, "manual", review["session_date"]):
-                        newly_marked.append((roll_no, name_part))
+                col_save, col_rescan = st.columns(2)
+                with col_rescan:
+                    if st.button("Rescan / Upload Different Photo"):
+                        st.session_state.review = None
+                        st.rerun()
 
-                export_day(review["session_date"])
+                with col_save:
+                    if st.button("Confirm & Save Attendance", type="primary"):
+                        newly_marked = []
 
-                st.success(
-                    f"Saved. {len(newly_marked)} student(s) newly marked present for {review['session_date']}."
-                )
-                st.session_state.review = None
-                st.rerun()
+                        for label in selections:
+                            roll_no, name = label_to_id[label]
+                            if roll_no:
+                                if mark_present(
+                                    roll_no, name, review["source"],
+                                    review["class_id"], review["subject_id"], review["teacher_id"],
+                                    review["session_date"],
+                                ):
+                                    newly_marked.append((roll_no, name))
+
+                        for label in manual_selected_labels:
+                            name_part, roll_part = label.rsplit(" (", 1)
+                            roll_no = roll_part.rstrip(")")
+                            if mark_present(
+                                roll_no, name_part, "manual",
+                                review["class_id"], review["subject_id"], review["teacher_id"],
+                                review["session_date"],
+                            ):
+                                newly_marked.append((roll_no, name_part))
+
+                        export_class_subject(review["class_id"], review["subject_id"], review["session_date"])
+
+                        full_roster = get_students_by_class(review["class_id"])
+                        present_count = len(get_attendance_for_session(review["class_id"], review["subject_id"], review["session_date"]))
+                        total_count = len(full_roster)
+
+                        st.success(
+                            f"Saved. {len(newly_marked)} student(s) newly marked present.\n\n"
+                            f"**Class:** {review['class_name']}  \n"
+                            f"**Subject:** {review['subject_name']}  \n"
+                            f"**Teacher:** {teacher['name']}  \n"
+                            f"**Date:** {review['session_date']}  \n\n"
+                            f"**Total Students:** {total_count}  \n"
+                            f"**Present:** {present_count}  \n"
+                            f"**Absent:** {total_count - present_count}"
+                        )
+                        st.session_state.review = None
+                        st.rerun()
 
 # ------------------------------------------------------------------- Enroll
 with tab_enroll:
     st.subheader("Enroll a new student")
 
-    roll_no = st.text_input("Roll number")
-    name = st.text_input("Full name")
-    photos = st.file_uploader(
-        "Upload multiple photos (different angles/expressions work best)",
-        type=["jpg", "jpeg", "png"],
-        accept_multiple_files=True,
-        key="enroll_photos",
-    )
+    all_classes = get_all_classes()
+    if not all_classes:
+        st.warning("No classes exist yet - run scripts/seed_academic_data.py to set up classes first.")
+    else:
+        enroll_class_id_by_name = {name: cid for cid, name in all_classes}
+        enroll_class_name = st.selectbox("Class", options=list(enroll_class_id_by_name.keys()), key="enroll_class")
+        enroll_class_id = enroll_class_id_by_name[enroll_class_name]
 
-    if st.button("Enroll student"):
-        if not roll_no or not name or not photos:
-            st.error("Roll number, name, and at least one photo are required.")
-        else:
-            folder_name = f"{roll_no}_{name.replace(' ', '_')}"
-            folder_path = os.path.join(ENROLLMENT_DIR, folder_name)
-            os.makedirs(folder_path, exist_ok=True)
+        roll_no = st.text_input("Roll number")
+        name = st.text_input("Full name")
+        photos = st.file_uploader(
+            "Upload multiple photos (different angles/expressions work best)",
+            type=["jpg", "jpeg", "png"],
+            accept_multiple_files=True,
+            key="enroll_photos",
+        )
 
-            for photo in photos:
-                with open(os.path.join(folder_path, photo.name), "wb") as f:
-                    f.write(photo.getbuffer())
-
-            with st.spinner("Generating embeddings..."):
-                count = enroll_student(roll_no, name, folder_path)
-
-            if count:
-                st.success(f"Enrolled {name} ({roll_no}) with {count} photo(s).")
+        if st.button("Enroll student"):
+            if not roll_no or not name or not photos:
+                st.error("Roll number, name, and at least one photo are required.")
             else:
-                st.error("No usable faces found in the uploaded photos - try clearer, front-facing shots.")
+                folder_name = f"{roll_no}_{name.replace(' ', '_')}"
+                folder_path = os.path.join(ENROLLMENT_DIR, folder_name)
+                os.makedirs(folder_path, exist_ok=True)
+
+                for photo in photos:
+                    with open(os.path.join(folder_path, photo.name), "wb") as f:
+                        f.write(photo.getbuffer())
+
+                with st.spinner("Generating embeddings..."):
+                    count = enroll_student(roll_no, name, folder_path, enroll_class_id)
+
+                if count:
+                    st.success(f"Enrolled {name} ({roll_no}) into {enroll_class_name} with {count} photo(s).")
+                else:
+                    st.error("No usable faces found in the uploaded photos - try clearer, front-facing shots.")
 
 # ------------------------------------------------------------------- Report
 with tab_report:
     st.subheader("Attendance report")
 
-    selected_date = st.date_input("Date", value=datetime.now())
-    date_str = selected_date.strftime("%Y-%m-%d")
-
-    present_rows = {row[0]: row for row in get_attendance_for_date(date_str)}
-    all_students = get_all_students()
-
-    if all_students:
-        roster = []
-        for roll_no, name in all_students:
-            if roll_no in present_rows:
-                roster.append(present_rows[roll_no])
-            else:
-                roster.append((roll_no, name, date_str, "", "Absent", "-"))
-
-        df = pd.DataFrame(roster, columns=["Roll No", "Name", "Date", "Time", "Status", "Source"])
-
-        present_count = (df["Status"] == "Present").sum()
-        col1, col2 = st.columns(2)
-        col1.metric("Present", int(present_count))
-        col2.metric("Absent", len(df) - int(present_count))
-
-        st.dataframe(df, use_container_width=True)
-
-        present_students = [(roll_no, name) for roll_no, name in all_students if roll_no in present_rows]
-        if present_students:
-            st.markdown("#### Undo a wrong mark")
-            st.caption("Wrongly confirmed someone as present? Remove them from this date below.")
-            undo_options = [f"{name} ({r})" for r, name in sorted(present_students, key=lambda x: x[1])]
-            undo_label = st.selectbox(
-                "Student to remove from today's Present list",
-                options=undo_options,
-                key=f"undo_select_{date_str}",
-            )
-            if st.button("Undo attendance for this student"):
-                name_part, roll_part = undo_label.rsplit(" (", 1)
-                undo_roll_no = roll_part.rstrip(")")
-                if delete_attendance(undo_roll_no, date_str):
-                    export_day(date_str)
-                    st.success(f"Removed {name_part} from {date_str}. Excel report updated.")
-                    st.rerun()
+    report_class_options = get_classes_for_teacher(teacher["id"])
+    if not report_class_options:
+        st.warning("You have no classes assigned.")
     else:
-        st.info("No students enrolled yet - use the Enroll Student tab first.")
+        report_class_id_by_name = {name: cid for cid, name in report_class_options}
+        report_class_name = st.selectbox("Class", options=list(report_class_id_by_name.keys()), key="report_class")
+        report_class_id = report_class_id_by_name[report_class_name]
 
-    if os.path.exists(MASTER_WORKBOOK):
-        with open(MASTER_WORKBOOK, "rb") as f:
-            st.download_button(
-                "Download master workbook",
-                data=f.read(),
-                file_name="master_attendance.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            )
+        report_subject_options = get_subjects_for_teacher_and_class(teacher["id"], report_class_id)
+        if not report_subject_options:
+            st.warning(f"You have no subjects assigned for {report_class_name}.")
+        else:
+            report_subject_id_by_name = {name: sid for sid, name in report_subject_options}
+            report_subject_name = st.selectbox("Subject", options=list(report_subject_id_by_name.keys()), key="report_subject")
+            report_subject_id = report_subject_id_by_name[report_subject_name]
+
+            selected_date = st.date_input("Date", value=datetime.now(), key="report_date")
+            date_str = selected_date.strftime("%Y-%m-%d")
+
+            present_rows = {row[0]: row for row in get_attendance_for_session(report_class_id, report_subject_id, date_str)}
+            roster = get_students_by_class(report_class_id)
+
+            if roster:
+                rows = []
+                for roll_no, name in roster:
+                    if roll_no in present_rows:
+                        rows.append(present_rows[roll_no])
+                    else:
+                        rows.append((roll_no, name, date_str, "", "Absent", "-"))
+
+                df = pd.DataFrame(rows, columns=["Roll No", "Name", "Date", "Time", "Status", "Source"])
+
+                present_count = (df["Status"] == "Present").sum()
+                col1, col2 = st.columns(2)
+                col1.metric("Present", int(present_count))
+                col2.metric("Absent", len(df) - int(present_count))
+
+                st.dataframe(df, use_container_width=True)
+
+                present_students = [(roll_no, name) for roll_no, name in roster if roll_no in present_rows]
+                if present_students:
+                    st.markdown("#### Undo a wrong mark")
+                    st.caption("Wrongly confirmed someone as present? Remove them from this session below.")
+                    undo_options = [f"{name} ({r})" for r, name in sorted(present_students, key=lambda x: x[1])]
+                    undo_label = st.selectbox(
+                        "Student to remove from this session's Present list",
+                        options=undo_options,
+                        key=f"undo_select_{report_class_id}_{report_subject_id}_{date_str}",
+                    )
+                    if st.button("Undo attendance for this student"):
+                        name_part, roll_part = undo_label.rsplit(" (", 1)
+                        undo_roll_no = roll_part.rstrip(")")
+                        if delete_attendance(undo_roll_no, report_class_id, report_subject_id, date_str):
+                            export_class_subject(report_class_id, report_subject_id, date_str)
+                            st.success(f"Removed {name_part} from {date_str}. Excel report updated.")
+                            st.rerun()
+            else:
+                st.info(f"No students enrolled in {report_class_name} yet - use the Enroll Student tab first.")
+
+            workbook_path = get_workbook_path(report_class_id, report_subject_id)
+            if os.path.exists(workbook_path):
+                with open(workbook_path, "rb") as f:
+                    st.download_button(
+                        "Download this class + subject's workbook",
+                        data=f.read(),
+                        file_name=os.path.basename(workbook_path),
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    )

@@ -4,3 +4,4 @@ openpyxl
 numpy
 pandas
 streamlit
+setuptools<81  # face_recognition_models still imports pkg_resources at runtime

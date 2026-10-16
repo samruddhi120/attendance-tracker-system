@@ -25,7 +25,7 @@ def parse_folder_name(folder_name):
     return roll_no, name.replace("_", " ")
 
 
-def enroll_student(roll_no, name, folder_path):
+def enroll_student(roll_no, name, folder_path, class_id=None):
     """
     Processes every photo in folder_path for one student and saves their
     embeddings to SQLite. Returns the number of photos successfully enrolled.
@@ -35,8 +35,12 @@ def enroll_student(roll_no, name, folder_path):
     Pulled out as its own function so both the CLI batch run below and the
     Streamlit "Enroll Student" tab can call the same logic on one student
     at a time, instead of duplicating it.
+
+    class_id: the student's class. The CLI batch path below has no source
+    for this (folder names only carry roll_no + name) and leaves it unset -
+    assign it afterwards via the Streamlit Enroll tab or a DB update.
     """
-    add_student(roll_no, name)
+    add_student(roll_no, name, class_id)
     already_enrolled = get_enrolled_photo_names(roll_no)
 
     photos_enrolled = 0
